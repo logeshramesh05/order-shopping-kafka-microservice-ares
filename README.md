@@ -1,6 +1,5 @@
 # Order–Shipping–ARES Platform: Full Technical Documentation
 
-# Documentation
 
 Detailed technical documentation for the Order–Shipping–ARES platform. For a quick start, see [`README.md`](./README.md).
 
@@ -235,34 +234,7 @@ Each service has its own multi-stage `Dockerfile` (Maven build → `eclipse-temu
 
 ---
 
-## 8. Adding OpenAPI/Swagger Docs
-
-None of the services have OpenAPI wired up yet. To add it:
-
-1. Add to each service's `pom.xml`:
-   ```xml
-   <dependency>
-       <groupId>org.springdoc</groupId>
-       <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
-       <version>2.6.0</version>
-   </dependency>
-   ```
-2. Run the service and open `http://localhost:<port>/swagger-ui.html` (raw spec at `/v3/api-docs`).
-3. Optionally add a config bean per service for title/description:
-   ```java
-   @Bean
-   public OpenAPI apiInfo() {
-       return new OpenAPI().info(new Info()
-               .title("Order Service API")
-               .description("Creates orders and publishes them to Kafka")
-               .version("v1"));
-   }
-   ```
-4. Optionally annotate controller methods with `@Operation` / `@ApiResponse` for richer docs.
-
----
-
-## 9. Testing
+## 8. Testing
 
 | Service | Tests |
 |---|---|
@@ -272,7 +244,7 @@ None of the services have OpenAPI wired up yet. To add it:
 
 ---
 
-## 10. Design Decisions & Tradeoffs
+## 9. Design Decisions & Tradeoffs
 
 - **Kafka instead of direct REST calls between `order` and `shipping`** — decouples the services and makes messages durable if a consumer is temporarily down, at the cost of added infrastructure complexity.
 - **Ports-and-adapters structure in `ares-service`** — each observation source (Docker, Kafka, Actuator, JVM metrics) is behind its own interface, making them independently testable and swappable, at the cost of more boilerplate than a single monolithic collector.
@@ -281,7 +253,7 @@ None of the services have OpenAPI wired up yet. To add it:
 
 ---
 
-## 11. Known Gaps / Roadmap
+## 10. Known Gaps / Roadmap
 
 - No consumer exists yet for `shipped_order_topic` — the event is published but not acted on.
 - Simulated (non-executed) chaos-fault types listed above.
