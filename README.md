@@ -1,20 +1,19 @@
 # Order–Shipping–ARES Platform: Full Technical Documentation
 
-**Repo contents analyzed:** `order/`, `shipping/`, `ares-service/`, `docker-compose.yml`
+
 **Stack:** Java 21+, Spring Boot 4.0.6, Apache Kafka, MySQL/TiDB Cloud, H2, Docker
-**Author's framing:** Order + Shipping is the original Kafka-driven microservice pair; ARES ("Autonomous Resilience Engine") is a new third service layered on top for observability, chaos engineering, and AI-assisted incident analysis.
 
 ---
 
-## 1. What this system actually does
+## 1. What this system does
 
-Three independently deployable Spring Boot services, wired together with Kafka and Docker Compose:
+Three independently deployable Spring Boot services, wired together with Kafka + Docker Compose:
 
 | Service | Port | Role |
 |---|---|---|
-| `order-service` | 8081 | Accepts an order, persists it, publishes it to Kafka |
-| `shipping-service` | 8082 | Consumes orders from Kafka, persists a shipping record, exposes an endpoint to mark an order shipped and publish that fact back to Kafka. Also hosts the ARES **Resilience Engine** (chaos experiments) |
-| `ares-service` | 8083 | Standalone platform-intelligence service: polls the health of the other two services + Docker + Kafka, stores snapshots, and calls an LLM (Groq) to explain incidents in plain English |
+| `order-service` | 8081 | Accepts an order, saves it, publishes it to Kafka |
+| `shipping-service` | 8082 | Consumes orders from Kafka, saves a shipping record, marks orders shipped, publishes that fact back to Kafka. Also hosts the ARES **Resilience Engine** (chaos experiments) |
+| `ares-service` | 8083 | Watches the health of the other two services + Docker + Kafka, stores snapshots, and calls an LLM (Groq) to explain incidents in plain English |
 
 ### 1.1 End-to-end flow
 
@@ -23,39 +22,30 @@ Client
   │  POST /api/orders/produce  { customerName, totalCost, address }
   ▼
 order-service ──save──▶ MySQL/TiDB "orders" table
-  │
   │  produces JSON string
   ▼
 Kafka topic: order_topic
-  │
   │  @KafkaListener consumes
   ▼
 shipping-service ──save──▶ MySQL/TiDB "shipping" table
-  │
   │  (later) DELETE /api/shipping/{orderId}
   ▼
 shipping-service ──delete row, produce Long orderId──▶ Kafka topic: shipped_order_topic
 ```
 
 ```
-ares-service (independent loop, every 30s by default)
-  ├─ DockerCliObservationAdapter   → `docker ps` on the host socket
-  ├─ KafkaAdminObservationAdapter  → AdminClient.describeCluster()
-  ├─ ActuatorHealthRestAdapter     → GET order-service:8081/actuator/health
-  │                                   GET shipping-service:8082/actuator/health
-  ├─ JvmSystemMetricsAdapter       → CPU / memory / disk / thread count of its own JVM
-  └─ ObservationService            → merges all of the above into one ObservationSnapshot,
-                                       computes an overall HealthState, persists it (H2/MySQL)
+ares-service (loop, every 30s)
+  ├─ Docker CLI          → `docker ps`
+  ├─ Kafka AdminClient   → describeCluster()
+  ├─ Actuator health     → GET order-service:8081/actuator/health, shipping-service:8082/...
+  └─ JVM metrics         → CPU / memory / disk / thread count
+  → merged into one snapshot, health state computed, saved to DB
 
 ares-service (on demand)
-  POST /api/operations/intelligence/analyze { incidentId, prompt, logs, metrics, health }
-       → GroqAdapter → Groq OpenAI-compatible chat completion → structured JSON
-       → rootCause / severity / businessImpact / recommendation / confidence / summary
+  POST /api/operations/intelligence/analyze → Groq LLM → rootCause / severity / recommendation
 
 shipping-service (on demand, chaos engineering)
-  POST /api/ares/resilience/run  { experimentType, affectedService, durationSeconds }
-       → LocalDockerOperationsPort → shells out to `docker stop/restart <container>`
-       → persists ResilienceExperimentRecord, returns outcome
+  POST /api/ares/resilience/run → shells out to `docker stop/restart <container>`
 ```
 
 ---
@@ -63,139 +53,136 @@ shipping-service (on demand, chaos engineering)
 ## 2. Service-by-service breakdown
 
 ### 2.1 `order-service`
-
-- `Order` — JPA entity: `id, customerName, totalCost, address, shipped`.
-- `OrderController.saveAndProducerOrder()` — saves to DB, then calls `OrderProducer.produceOrder()`. **Single HTTP call does two side effects** (DB write + Kafka publish) with no transactional link between them (see §4.1).
-- `OrderProducer` — serializes `Order` to JSON with Jackson and sends it as a raw `String` to `order_topic` via `KafkaTemplate<String, String>`.
-- No DTO layer — the JPA entity itself is the request body, the response body, and the Kafka payload.
+- `Order` entity: `id, customerName, totalCost, address, shipped`
+- One controller method does two things with no link between them: save to DB, then publish to Kafka
+- No DTO layer — the JPA entity is also the request body, response body, and Kafka payload
 
 ### 2.2 `shipping-service`
-
-- `Shipping` — a **second, independent** JPA entity that duplicates `customerName/totalCost/address` and adds `shipping` (boolean) instead of `shipped`.
-- `ShippingConsumer.consumeOrder()` — `@KafkaListener` on `order_topic`, deserializes the JSON string straight into a `Shipping` object (relies on field-name coincidence between `Order` and `Shipping`, not a shared contract — see §4.2), then saves it via `ShippingController.saveShipping()`.
-- `ShippingController`:
-  - `DELETE /api/shipping/{orderId}` — the "mark as shipped" action. It **deletes** the row from `shipping` (rather than flipping a status flag) and publishes the bare `Long orderId` to `shipped_order_topic`.
-  - `GET /api/shipping` — lists everything still pending shipment (since shipped rows are deleted).
-- `ShippedOrderIdProducer` — separate `KafkaTemplate<String, Long>` (different value-serializer from the order producer) publishing just the ID.
-- **ARES Resilience Engine lives inside this service** (`com.example.kafka.shipping.ares.resilience` package): a self-contained hexagonal slice — `ResilienceEnginePort` / `ResilienceEngineService` / `DockerOperationsPort` / `LocalDockerOperationsPort` — that runs Docker-based chaos experiments (stop container, restart, simulate latency/packet-loss/Kafka-outage/DB-outage) against the platform and journals every run to `ares_resilience_experiments`.
+- `Shipping` entity duplicates `customerName/totalCost/address` but is a **separate, independently defined** entity from `Order`
+- Kafka listener deserializes the incoming JSON string directly into `Shipping`, relying on matching field names — not a shared contract
+- `DELETE /api/shipping/{orderId}` = "mark as shipped." It **deletes the row** (doesn't flip a status flag) and publishes the order ID to `shipped_order_topic`
+- `GET /api/shipping` lists what's still pending (shipped rows no longer exist in this table)
+- Hosts the **ARES Resilience Engine**: runs Docker-based chaos experiments (stop/restart a container, simulated latency/packet-loss/Kafka-outage/DB-outage) and logs every run to a `ares_resilience_experiments` table
 
 ### 2.3 `ares-service`
+Built with **ports-and-adapters (hexagonal) architecture** — different style from `order`/`shipping`'s flat controller→service→repository shape.
 
-Structured as clean **ports-and-adapters (hexagonal) architecture**, in contrast to `order`/`shipping`'s flat controller-service-repository style:
+**Observation module** (read-only platform telemetry):
+- Domain objects (`ObservationSnapshot`, `ObservedComponent`, etc.) are immutable Java records
+- Each data source (Docker, Kafka, Actuator, JVM, DB history) sits behind its own interface ("port"), with one real implementation ("adapter") per port
+- `ObservationService` fans out to all ports, merges results, decides overall health (`DOWN` > `DEGRADED` > `UNKNOWN` > `UP`), and saves the snapshot
+- Runs automatically every 30s (configurable) and is also callable on demand via REST
 
-- **`observation` bounded context** — read-only platform telemetry.
-  - Domain: `ObservationSnapshot`, `ObservedComponent`, `ResourceSample`, `ComponentType`, `HealthState` — all Java `record`s, immutable.
-  - Ports: `DockerObservationPort`, `KafkaObservationPort`, `ActuatorHealthPort`, `SystemMetricsPort`, `ObservationHistoryPort`.
-  - Adapters implement each port against a real technology (Docker CLI, Kafka AdminClient, RestTemplate + Actuator, JVM `OperatingSystemMXBean`, JPA).
-  - `ObservationService.collectSnapshot()` fans out to every port, merges results, derives one `HealthState` (`DOWN` > `DEGRADED` > `UNKNOWN` > `UP` priority), and persists via the history port. A `@Scheduled` job runs this automatically every `ares.observation.collection-interval-ms` (default 30s); the same logic is also reachable synchronously via `POST /api/operations/observations/collect`.
-- **`intelligence` bounded context** — AI-assisted analysis, fully decoupled from `observation`.
-  - `AIAnalysisPort` is provider-neutral; `GroqAdapter` is the only current implementation (OpenAI-compatible `/chat/completions` against Groq, model configurable, defaults to `openai/gpt-oss-120b`).
-  - The adapter builds a plain-text prompt (incident id, free-text prompt, logs, metrics, health), asks for **JSON-only** output, strips markdown code fences defensively, and parses into an `AIAnalysisResult`. If the API key is missing, the network call fails, or parsing fails, it degrades to a structured "unavailable" result instead of throwing — the controller always gets a 200 with a meaningful payload.
-- Shared: `GlobalExceptionHandler` (`@RestControllerAdvice`) gives every endpoint a consistent `ErrorResponse` shape; `ObservationProperties` / `IntelligenceProperties` are `@ConfigurationProperties`-bound and `@Validated`, so misconfiguration fails fast at startup rather than at request time.
+**Intelligence module** (AI-assisted analysis):
+- `AIAnalysisPort` is provider-neutral; `GroqAdapter` is the only implementation today
+- Builds a prompt from incident id + logs + metrics + health, asks the LLM for JSON-only output, parses it defensively (strips markdown fences, falls back gracefully on parse failure)
+- Never throws — a missing API key or a failed call still returns a normal 200 response with `severity: UNKNOWN` and an explanation
 
 ---
 
 ## 3. Infrastructure & deployment
 
-`docker-compose.yml` wires: Zookeeper → Kafka (Confluent 7.4.1, dual listener for in-network + host access) → `order-service` → `shipping-service` → `ares-service` (depends on both). Notable choices:
-
-- **Different persistence per service.** `order`/`shipping` point at a **shared external TiDB Cloud (MySQL-compatible) cluster**, two separate schemas (`orders`, `shipping`). `ares-service` defaults to an **in-memory H2** database (`MODE=MySQL`), overridable via `ARES_SPRING_DATASOURCE_URL`.
-- **`ares-service` mounts the host Docker socket** (`/var/run/docker.sock:/var/run/docker.sock`) so its `DockerCliObservationAdapter` can run `docker ps` against the *host's* Docker daemon from inside a container. The chaos-engineering `LocalDockerOperationsPort` in `shipping-service` needs the same capability but the compose file doesn't mount the socket into `shipping-service` — meaning `docker stop/restart` calls from inside that container will currently fail unless it's run outside Docker or the socket is added there too (see §4.5).
-- Kafka bootstrap servers are `kafka:29092` inside the compose network vs `localhost:9092` for local dev outside Docker — handled correctly via environment variable overrides in each `application.properties`.
-
----
-
-## 4. Architectural tradeoffs — the "why" and the cost
-
-This is the part that matters most for a resume/portfolio writeup or an interview: every one of these is a defensible decision *for a learning/demo project*, but each has a specific, nameable cost at production scale.
-
-### 4.1 No transactional outbox / no distributed transaction between DB write and Kafka publish
-**Decision:** `OrderController` calls `orderRepository.save()` then `orderProducer.produceOrder()` sequentially, in the same method, with no compensating logic.
-**Tradeoff:** Simple, fast to build, easy to reason about in the happy path.
-**Cost:** If the process crashes or Kafka is unreachable *after* the DB commit but before/during the `send()`, the order is saved but never reaches `shipping-service` — a silently lost order with no retry, no dead-letter, no outbox table. The inverse (Kafka succeeds, DB write later rolled back — not applicable here since save happens first, but generally) is the classic **dual-write problem**. Production fix: transactional outbox pattern, or Debezium CDC on the `orders` table instead of an application-level producer call.
-
-### 4.2 Implicit schema coupling between `Order` and `Shipping` instead of a shared contract
-**Decision:** `order-service` publishes `Order` serialized to JSON; `shipping-service` deserializes the same bytes directly into its own, separately-defined `Shipping` entity, relying on matching field names (`customerName`, `totalCost`, `address`) and silently dropping/defaulting the rest (`id` → new autoincrement `Id` in `shipping`, `shipped` boolean not mapped to `shipping` boolean — they're different fields entirely).
-**Tradeoff:** Zero shared library, zero versioning ceremony, each service owns its own model — good for team/service autonomy.
-**Cost:** No compile-time or schema-registry-enforced contract. A field rename in `order-service` (e.g. `customerName` → `customerFullName`) breaks `shipping-service` at runtime with a silent `null`, not a build failure. This is the textbook argument for a shared Avro/Protobuf schema + Confluent Schema Registry, or at minimum a shared DTO module, once more than one team touches these services.
-
-### 4.3 Delete-as-completion instead of a status field
-**Decision:** "Shipped" is modeled by **deleting** the row from the `shipping` table (`DELETE /api/shipping/{orderId}`) rather than setting `shipping = true`.
-**Tradeoff:** Trivial query for "what's still pending" (`SELECT * FROM shipping` — no `WHERE` clause needed), and it's the fewest lines of code to demonstrate the producer→consumer→producer round trip.
-**Cost:** Destroys the audit trail. There is no way to query "orders shipped last week" from this table ever again — that history now only exists as a Kafka message on `shipped_order_topic` (and only for as long as that topic's retention holds, or a consumer group has committed past it). Any downstream reporting, refund/dispute handling, or reconciliation job has nowhere to look. A `status` enum column plus a `shipped_at` timestamp costs one migration and avoids this permanently.
-
-### 4.4 Two different `KafkaTemplate` value types across three topics, both using `String`/raw serializers instead of a schema
-**Decision:** `order_topic` carries hand-serialized JSON `String`; `shipped_order_topic` carries a raw `Long`. Consumer side uses `spring.json.trusted.packages=*` for the wildcard trust (a known Spring Kafka footgun if this were ever pointed at an untrusted Kafka cluster, since it would deserialize arbitrary types).
-**Tradeoff:** No Avro/Protobuf toolchain to set up; anyone can `kafkacat`/console-consume and read the payload as plain text — great for debugging a college/portfolio project.
-**Cost:** No compatibility checking, no schema evolution safety net, and `trusted.packages=*` is flagged by most security scanners as a deserialization risk (even though the current payload is just a `String`, the setting itself is broad). Fine here because both producer and consumer are first-party code the author controls; would need tightening (`spring.json.trusted.packages=com.example.kafka.*` at minimum) before treating this as production-representative.
-
-### 4.5 Hardcoded database credentials with real values as Spring property *defaults*
-**Decision:** Both `order/src/main/resources/application.properties` and `shipping/.../application.properties` hardcode the **actual** TiDB Cloud username (`2AaAz4LnhRj3Eeq.root`) and password (`DHc5zd5PZUTXSj8G`) as the fallback value inside `${SPRING_DATASOURCE_PASSWORD:DHc5zd5PZUTXSj8G}` — meaning they ship to source control even though the *pattern* (env-var override) looks correctly externalized.
-**Tradeoff:** Convenient for local `mvn spring-boot:run` without needing a `.env` file every time — this is almost certainly why it happened (fast iteration during a hackathon/internship-style build).
-**Cost:** This is a genuine, live secret leak once the repo is pushed anywhere public or shared — exactly the security risk you (Logesh) already flagged. The `${VAR:default}` syntax is only safe when the default is a *placeholder*, never a real credential. **Fix, in order of effort:**
-  1. Immediate: rotate the TiDB password now that it's been committed anywhere, treat the old one as burned.
-  2. Change defaults to empty/placeholder strings so the app *fails loudly* if the env var isn't set, instead of silently falling back to a real (or now-revoked) credential.
-  3. Move actual secrets into `.env` (already `git-ignore`d per the compose setup — `env_file: .env` is used for the containers) or a proper secrets manager, never into `application.properties`.
-  4. Add a pre-commit hook or GitHub secret-scanning to prevent recurrence.
-
-  ARES's own `application.properties` gets this right, by contrast — its default (`sa` / empty password against in-memory H2) is genuinely harmless because H2 is ephemeral, and the Groq key has an **empty** default (`${GROQ_API_KEY:}`), which is exactly the correct pattern.
-
-### 4.6 Hexagonal architecture in `ares-service`, flat layering in `order`/`shipping`
-**Decision:** The two original services use a conventional `Controller → Service(optional) → Repository` shape with entities doing double duty as DTOs. `ares-service` introduces explicit domain records, ports, and adapters, and keeps persistence entities (`ObservationMetricRecord`) separate from domain models (`ObservationSnapshot`).
-**Tradeoff:** The hexagonal style in ARES makes it trivial to swap `GroqAdapter` for an OpenAI/Anthropic adapter later (just implement `AIAnalysisPort`), or to unit-test `ObservationService` with fake ports with zero Spring context — evidenced by the adapter-level unit tests present in `ares-service/src/test`. It costs more boilerplate (a port + an adapter + a DTO + a domain record for one concept) for a project this size.
-**Cost/inconsistency:** The stack is now **architecturally inconsistent across services** — a reviewer (or a future contributor) has to learn two different conventions in one codebase. That's a fair tradeoff if ARES is deliberately the "showcase good architecture" module of the portfolio, but it's worth stating explicitly rather than leaving it implicit, since otherwise it reads as inconsistency rather than intent.
-
-### 4.7 Observation Engine: polling/pull model, not event-driven
-**Decision:** ARES's health picture is built by **actively polling** (Docker CLI, Kafka AdminClient, Actuator HTTP) every 30 seconds by default, rather than the other services pushing health events or metrics.
-**Tradeoff:** Zero changes required to `order-service`/`shipping-service` beyond having Actuator on the classpath (which they don't currently expose — see §5) — ARES can observe *any* Spring Boot service without that service knowing ARES exists. Simple to reason about, easy to demo on a laptop.
-**Cost:** 30-second blind spots between polls; a service that crashes and restarts inside one interval is invisible. Polling N services also means N sequential/parallel HTTP calls plus a `docker ps` shell-out plus a Kafka admin round trip every cycle — fine at 2 services, doesn't scale past a handful without either parallelizing the fan-out (it currently isn't — `observeServiceHealth()` iterates the map synchronously) or moving to push-based metrics (Micrometer → Prometheus scrape, which the `pom.xml` already pulls in via `micrometer-registry-prometheus` but isn't wired up yet for cross-service polling).
-
-### 4.8 Graceful-degradation-over-exceptions in the Intelligence Engine
-**Decision:** `GroqAdapter.analyze()` never throws out of its public method — missing API key, network failure, and unparsable AI output all become a valid `AIAnalysisResult` with `severity = UNKNOWN` and a human-readable `summary` explaining what went wrong.
-**Tradeoff:** The `/analyze` endpoint is always a 200 with a body a UI can render directly, no special-casing 4xx/5xx GROQ failures on the client. This is genuinely a *good* production pattern for an "AI as a feature, not the critical path" use case.
-**Cost:** Callers must inspect `severity`/`confidence` to know whether the answer is *real* — an unmonitored caller could silently trust a `confidence: 0.0, rootCause: "AI provider unavailable"` result as if it were a real diagnosis. Worth pairing with a `provider != "unavailable"`-style explicit status field if this ever becomes a UI a real on-call engineer stares at during an incident.
-
-### 4.9 Chaos-engineering blast radius: real `docker stop/restart` on shared infrastructure, gated by nothing but the request body
-**Decision:** `ResilienceController` (in `shipping-service`) accepts a POST with an arbitrary `affectedService` string and, for `STOP_CONTAINER`/`RESTART_SERVICE` experiment types, shells out to `docker stop <affectedService>` / `docker restart <affectedService>` with **no allow-list, no auth, no confirmation step**. `INJECT_LATENCY`/`SIMULATE_PACKET_LOSS`/`SIMULATE_KAFKA_FAILURE`/`SIMULATE_DATABASE_FAILURE` are currently **simulated in name only** — they return a canned string and don't actually touch `tc`/`netem`/toxiproxy/anything.
-**Tradeoff:** This is honest, useful scaffolding — the port/adapter split (`DockerOperationsPort`) means swapping in a real latency-injection adapter (e.g. Toxiproxy, Pumba, or `tc netem` via another CLI adapter) later doesn't touch the controller or the persistence layer at all.
-**Cost, if this ever runs anywhere but a personal sandbox:** `docker stop kafka` or `docker stop <anything on the host Docker daemon>` is possible from this endpoint today, since the string is passed straight through with only case-normalization, no allow-list of "experiments only ever target these containers." That's fine on `localhost`; it would need an allow-list + auth + maybe a "confirm" token before being safe to expose even on an internal network.
-
-### 4.10 No API layer / no gateway / no auth anywhere in the three services
-**Decision:** Every REST endpoint across all three services (`/api/orders`, `/api/shipping`, `/api/ares/resilience`, `/api/operations/*`) is unauthenticated and directly reachable on its mapped port.
-**Tradeoff:** Removes an entire category of setup (API gateway, JWT/OAuth2 resource server config, CORS) from a project whose goal is demonstrating Kafka + observability + AI patterns, not auth.
-**Cost:** Not remotely deployable as-is without an API gateway or Spring Security layer in front — worth stating as an explicit "not yet done, by design, for scope reasons" in any writeup rather than letting a reviewer assume it was missed.
+- `docker-compose.yml` chains: Zookeeper → Kafka → `order-service` → `shipping-service` → `ares-service`
+- `order`/`shipping` point at a **shared external TiDB Cloud cluster** (two schemas: `orders`, `shipping`)
+- `ares-service` defaults to **in-memory H2** — overridable via env var
+- `ares-service` mounts the host's Docker socket so it can run `docker ps` from inside a container
+- `shipping-service` does **not** get the same socket mount, even though its Resilience Engine also needs to run `docker stop/restart` — a mismatch (see §4.5)
 
 ---
 
-## 5. Gaps worth naming (not necessarily fixing before your resume/interview, but worth knowing)
+## 4. Tradeoffs — what was chosen, why, and what it costs
 
-1. **No transactional outbox** for order → Kafka (see 4.1).
-2. **No schema registry / Avro / Protobuf** — raw JSON strings on the wire (see 4.4).
-3. **`order-service`/`shipping-service` don't expose Actuator** in their `pom.xml`s (only `ares-service` has `spring-boot-starter-actuator`), yet `ares-service`'s `ActuatorHealthRestAdapter` depends on `GET .../actuator/health` on those two services — this will 404/fail until Actuator is added to `order`/`shipping`'s dependencies. Worth double-checking against the actual runtime behavior described in memory (hardcoded credentials were already flagged as a risk — this would be the next thing a reviewer notices).
-4. **Hardcoded live DB credentials** in two `application.properties` files (see 4.5) — highest-priority fix.
-5. **Docker socket only mounted for `ares-service`**, not `shipping-service`, even though the Resilience Engine (which needs it) lives in `shipping-service` (see §3, 4.9).
-6. **No allow-list/auth on chaos experiments** (see 4.9).
-7. **Sequential, unparallelized health polling** in `ActuatorHealthRestAdapter.observeServiceHealth()` (see 4.7) — a `Map.forEach` doing blocking HTTP calls one at a time.
-8. **No dead-letter topic / retry policy** configured on the `shipping-service` Kafka consumer — a poison-pill message on `order_topic` will loop per Spring Kafka's default error-handling behavior rather than being quarantined.
+Each item is a design choice that makes sense for a learning/portfolio project, paired with what it would cost in production. This is the section worth knowing cold for an interview.
+
+### 4.1 Order saved to DB and published to Kafka in one method, no safety net
+- **What:** `save()` then `send()`, sequentially, with no compensating logic if one succeeds and the other fails
+- **Why it's fine here:** simplest possible flow, easy to build and demo
+- **Cost at scale:** if the process crashes right after the DB commit but before Kafka receives the message, the order is saved but *never reaches shipping* — silently lost, no retry, no dead-letter
+- **Production fix:** transactional outbox pattern, or CDC (e.g. Debezium) reading the `orders` table instead of an app-level Kafka call
+
+### 4.2 `Order` and `Shipping` are two separate entities with no shared contract
+- **What:** `shipping-service` deserializes the Kafka payload straight into its own `Shipping` class, trusting that field names happen to match
+- **Why it's fine here:** zero shared library needed, each service stays fully independent
+- **Cost at scale:** no compile-time or schema check — rename a field in `order-service` and `shipping-service` silently gets `null`, not a build error
+- **Production fix:** shared DTO module, or Avro/Protobuf + a schema registry
+
+### 4.3 "Shipped" = row deleted, not a status flag
+- **What:** marking an order shipped deletes it from the `shipping` table instead of setting `shipping = true`
+- **Why it's fine here:** makes "what's pending" a trivial query with no `WHERE` clause
+- **Cost at scale:** kills the audit trail permanently — no way to ever query "orders shipped last week" from this table again
+- **Production fix:** add a `status` enum + `shipped_at` timestamp column instead of deleting
+
+### 4.4 Raw JSON/`Long` on Kafka, no schema registry, wildcard trusted packages
+- **What:** `order_topic` carries a hand-built JSON string, `shipped_order_topic` carries a raw `Long`; consumer config trusts `*` packages for deserialization
+- **Why it's fine here:** no Avro/Protobuf tooling needed, anyone can read the topic with a plain console consumer
+- **Cost at scale:** no schema evolution safety net, and `trusted.packages=*` is flagged by most security scanners as a deserialization risk
+- **Production fix:** Avro/Protobuf + schema registry, and scope trusted packages down to `com.example.kafka.*`
+
+### 4.5 Hardcoded live database credentials — **highest priority fix**
+- **What:** both `order` and `shipping` `application.properties` files hardcode the *real* TiDB username and password as the fallback value inside `${SPRING_DATASOURCE_PASSWORD:actualPasswordHere}`
+- **Why it happened:** convenient for running locally without needing a `.env` file every time
+- **Cost:** this is a genuine leaked secret the moment the repo is pushed anywhere shared or public
+- **Fix, in order:**
+  1. Rotate the TiDB password now — treat the committed one as burned
+  2. Change the defaults to empty placeholders so the app fails loudly instead of silently using a real/dead credential
+  3. Keep actual secrets only in `.env` (already used for containers) or a secrets manager
+  4. Add secret-scanning or a pre-commit hook to prevent this happening again
+- **Worth noting:** `ares-service` gets this right — its H2 default is harmless (throwaway in-memory DB) and its Groq key default is empty, which is the correct pattern
+
+### 4.6 Two different architectural styles in one codebase
+- **What:** `order`/`shipping` use a flat controller→service→repository shape; `ares-service` uses ports-and-adapters with separate domain/persistence models
+- **Why it's fine here:** ARES's style makes swapping `GroqAdapter` for a different LLM provider trivial, and makes `ObservationService` fully unit-testable without Spring
+- **Cost:** a reviewer has to learn two different conventions in the same repo — fine if framed as "ARES is the showcase-architecture module," confusing if left unexplained
+
+### 4.7 Health checks are polled, not pushed
+- **What:** ARES actively polls Docker/Kafka/Actuator every 30 seconds rather than services pushing events
+- **Why it's fine here:** zero changes needed in `order`/`shipping` for ARES to observe them
+- **Cost:** up to 30-second blind spots; a crash-and-restart inside one interval is invisible; health checks currently run one at a time, not in parallel, so this won't scale past a handful of services without changes
+- **Production fix:** parallelize the checks (Java 21 virtual threads make this cheap), or move to push-based metrics via the Micrometer/Prometheus dependency already in the project but not yet wired up
+
+### 4.8 AI analysis always returns 200, even on failure
+- **What:** missing API key, network failure, or unparsable AI response all become a valid-looking result with `severity: UNKNOWN` instead of an HTTP error
+- **Why it's fine here:** a UI can always render the response with no special-casing
+- **Cost:** a careless caller could treat a "the AI is unavailable" result as if it were a real diagnosis
+- **Fix:** add an explicit `providerAvailable: true/false` field so callers can't miss the difference
+
+### 4.9 Chaos experiments have no allow-list, no auth
+- **What:** the resilience endpoint takes an arbitrary `affectedService` string and runs `docker stop`/`docker restart` on it directly — no whitelist, no confirmation, no auth check
+- **Why it's fine here:** clean port/adapter split means swapping in real latency-injection tooling (Toxiproxy, `tc netem`) later won't touch the controller at all
+- **Cost:** on any shared or internal network, this endpoint could stop *any* container on the host Docker daemon, not just the intended targets
+- **Fix:** allow-list of experiment-eligible containers, plus auth, before exposing this beyond localhost
+
+### 4.10 No auth, no gateway, anywhere
+- **What:** every REST endpoint across all three services is open, unauthenticated
+- **Why it's fine here:** keeps the project scoped to demonstrating Kafka + observability + AI patterns, not auth infrastructure
+- **Cost:** not deployable as-is without a gateway or Spring Security layer in front
+- **Worth stating explicitly** in any writeup as "not done, by design, for scope" rather than letting it look like an oversight
 
 ---
 
-## 6. If you were narrating this in an interview
+## 5. Other gaps worth knowing
 
-A clean way to frame this project's story, given the tradeoffs above:
-
-- **Order + Shipping** demonstrates core event-driven microservice fundamentals: Kafka producer/consumer, per-service database ownership, REST APIs — deliberately kept simple to isolate and showcase the messaging pattern.
-- **ARES** is the "level-up" module: same platform, but built with ports-and-adapters so that Docker, Kafka, Actuator, and an LLM provider are all swappable implementation details behind stable interfaces — and it adds three production-adjacent capabilities most personal projects skip: **continuous health observation, incident AI-analysis, and chaos engineering.**
-- The known gaps (hardcoded creds, no transactional outbox, no schema registry, no auth) are the natural "what I'd do differently / what's next" answer — they show you can name the tradeoff, not just that a mistake happened. That's a stronger interview answer than pretending the project is production-ready.
+- `order`/`shipping` don't have `spring-boot-starter-actuator` in their `pom.xml` — meaning ARES's health polling against `/actuator/health` on those services will currently fail until it's added
+- Docker socket is mounted for `ares-service` but not `shipping-service`, even though the Resilience Engine needing it lives in `shipping-service`
+- No dead-letter topic or retry policy on the `shipping-service` Kafka consumer — a bad message on `order_topic` will loop by default instead of being quarantined
+- `INJECT_LATENCY` / `SIMULATE_PACKET_LOSS` / `SIMULATE_KAFKA_FAILURE` / `SIMULATE_DATABASE_FAILURE` experiment types are simulated in name only right now — they return a canned string, they don't actually touch the network or DB
 
 ---
 
-## 7. Suggested next increments, roughly in priority order
+## 6. How to frame this in an interview
 
-1. Rotate the TiDB credentials; replace hardcoded defaults with empty placeholders.
-2. Add `spring-boot-starter-actuator` to `order`/`shipping` `pom.xml`s so ARES's health polling actually works end-to-end.
-3. Add a `status` enum (`PENDING`, `SHIPPED`, `CANCELLED`) to `shipping` instead of delete-as-completion.
-4. Introduce a shared schema (even a simple shared DTO module, or Avro + Schema Registry if you want the resume line) between `order` and `shipping`.
-5. Parallelize `ActuatorHealthRestAdapter` health checks (`CompletableFuture`/virtual threads — Java 21 gives you both cheaply).
-6. Add an allow-list of experiment-eligible container names to the Resilience Engine, and mount the Docker socket into `shipping-service` if chaos experiments are meant to run from there.
-7. Wire Micrometer → Prometheus → Grafana for the metrics ARES already collects, instead of only exposing them via REST/H2.
+- **Order + Shipping** = core event-driven microservice fundamentals (Kafka producer/consumer, per-service DB ownership), deliberately kept simple to isolate the messaging pattern
+- **ARES** = the "level-up" module — same platform, but built so Docker/Kafka/Actuator/the LLM provider are all swappable behind stable interfaces, adding observability + AI incident analysis + chaos engineering
+- The known gaps (hardcoded creds, no outbox, no schema registry, no auth) make a stronger "what I'd do differently" answer than pretending the project is production-ready
+
+---
+
+## 7. Suggested next steps, in priority order
+
+1. Rotate the TiDB credentials; replace hardcoded defaults with empty placeholders
+2. Add `spring-boot-starter-actuator` to `order`/`shipping` so ARES's health polling works end-to-end
+3. Replace delete-as-completion with a `status` enum on `shipping`
+4. Introduce a shared schema/DTO module (or Avro + Schema Registry) between `order` and `shipping`
+5. Parallelize ARES's Actuator health checks
+6. Add an allow-list + auth to the Resilience Engine, and fix the Docker socket mount mismatch
+7. Wire Micrometer → Prometheus → Grafana instead of only exposing metrics via REST/H2
