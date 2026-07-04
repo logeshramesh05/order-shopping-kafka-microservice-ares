@@ -1,7 +1,7 @@
 # Order–Shipping–ARES Platform: Full Technical Documentation
 
 
-**Stack:** Java 21+, Spring Boot 4.0.6, Apache Kafka, MySQL/TiDB Cloud, H2, Docker
+**Stack:** Java 21+, Spring Boot 4.0.6, Apache Kafka, MySQL/TiDB Cloud, Docker
 
 ---
 
