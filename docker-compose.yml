@@ -1,0 +1,117 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.1
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - kafka-network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.1
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+    networks:
+      - kafka-network
+
+  order-service:
+    build:
+      context: ./order
+      dockerfile: Dockerfile
+    container_name: order-service
+    depends_on:
+      - kafka
+    ports:
+      - "8081:8081"
+    env_file:
+      - .env
+    environment:
+      SPRING_APPLICATION_NAME: order
+      SERVER_PORT: 8081
+      SPRING_DATASOURCE_URL: ${ORDER_SPRING_DATASOURCE_URL}
+      SPRING_DATASOURCE_DRIVER_CLASS_NAME: com.mysql.cj.jdbc.Driver
+      SPRING_JPA_HIBERNATE_DDL_AUTO: update
+      SPRING_JPA_SHOW_SQL: "true"
+      SPRING_KAFKA_PRODUCER_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_KAFKA_PRODUCER_KEY_SERIALIZER: org.apache.kafka.common.serialization.StringSerializer
+      SPRING_KAFKA_PRODUCER_VALUE_SERIALIZER: org.apache.kafka.common.serialization.StringSerializer
+    networks:
+      - kafka-network
+
+  shipping-service:
+    build:
+      context: ./shipping
+      dockerfile: Dockerfile
+    container_name: shipping-service
+    depends_on:
+      - kafka
+    ports:
+      - "8082:8082"
+    env_file:
+      - .env
+    environment:
+      SPRING_APPLICATION_NAME: shipping
+      SERVER_PORT: 8082
+      SPRING_DATASOURCE_URL: ${SHIPPING_SPRING_DATASOURCE_URL}
+      SPRING_DATASOURCE_DRIVER_CLASS_NAME: com.mysql.cj.jdbc.Driver
+      SPRING_JPA_HIBERNATE_DDL_AUTO: update
+      SPRING_JPA_SHOW_SQL: "true"
+      SPRING_KAFKA_CONSUMER_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_KAFKA_CONSUMER_GROUP_ID: shipping-group
+      SPRING_KAFKA_CONSUMER_AUTO_OFFSET_RESET: earliest
+      SPRING_KAFKA_CONSUMER_KEY_DESERIALIZER: org.apache.kafka.common.serialization.StringDeserializer
+      SPRING_KAFKA_CONSUMER_VALUE_DESERIALIZER: org.apache.kafka.common.serialization.StringDeserializer
+      SPRING_KAFKA_CONSUMER_PROPERTIES_SPRING_JSON_TRUSTED_PACKAGES: "*"
+    networks:
+      - kafka-network
+
+  ares-service:
+    build:
+      context: ./ares-service
+      dockerfile: Dockerfile
+    container_name: ares-service
+    depends_on:
+      - kafka
+      - order-service
+      - shipping-service
+    ports:
+      - "8083:8083"
+    env_file:
+      - .env
+    environment:
+      SPRING_APPLICATION_NAME: ares-service
+      SERVER_PORT: 8083
+      SPRING_DATASOURCE_DRIVER_CLASS_NAME: ${ARES_SPRING_DATASOURCE_DRIVER_CLASS_NAME:-org.h2.Driver}
+      ARES_SPRING_DATASOURCE_URL: ${ARES_SPRING_DATASOURCE_URL:-jdbc:h2:mem:ares;MODE=MySQL;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE}
+      SPRING_JPA_HIBERNATE_DDL_AUTO: update
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      ARES_OBSERVATION_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      ARES_ORDER_ACTUATOR_HEALTH_URL: http://order-service:8081/actuator/health
+      ARES_SHIPPING_ACTUATOR_HEALTH_URL: http://shipping-service:8082/actuator/health
+      ARES_AI_PROVIDER: ${ARES_AI_PROVIDER:-groq}
+      GROQ_BASE_URL: ${GROQ_BASE_URL:-https://api.groq.com/openai/v1/chat/completions}
+      GROQ_MODEL: ${GROQ_MODEL:-openai/gpt-oss-120b}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - kafka-network
+
+networks:
+  kafka-network:
+    driver: bridge
